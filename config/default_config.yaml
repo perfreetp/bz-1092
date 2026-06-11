@@ -1,0 +1,100 @@
+device_resolutions:
+  mobile:
+    - name: "iPhone 15 Pro"
+      width: 1179
+      height: 2556
+      orientation: portrait
+    - name: "iPhone 15 Pro Max"
+      width: 1290
+      height: 2796
+      orientation: portrait
+    - name: "Android 1080p"
+      width: 1080
+      height: 2340
+      orientation: portrait
+    - name: "Android 1440p"
+      width: 1440
+      height: 3120
+      orientation: portrait
+  desktop:
+    - name: "Full HD"
+      width: 1920
+      height: 1080
+      orientation: landscape
+    - name: "2K QHD"
+      width: 2560
+      height: 1440
+      orientation: landscape
+    - name: "4K UHD"
+      width: 3840
+      height: 2160
+      orientation: landscape
+    - name: "Ultrawide"
+      width: 3440
+      height: 1440
+      orientation: landscape
+  tablet:
+    - name: "iPad Pro 12.9"
+      width: 2048
+      height: 2732
+      orientation: portrait
+    - name: "iPad Air"
+      width: 1640
+      height: 2360
+      orientation: portrait
+
+quality_check:
+  blur_threshold: 100.0
+  min_resolution:
+    width: 1920
+    height: 1080
+  duplicate_threshold: 5
+  allowed_formats:
+    - .jpg
+    - .jpeg
+    - .png
+    - .webp
+    - .bmp
+
+output:
+  jpeg_quality: 95
+  png_compression: 6
+  preview_size:
+    width: 400
+    height: 400
+  watermark:
+    enabled: false
+    text: ""
+    opacity: 0.3
+
+organization:
+  color_tags:
+    - "red"
+    - "orange"
+    - "yellow"
+    - "green"
+    - "cyan"
+    - "blue"
+    - "purple"
+    - "pink"
+    - "brown"
+    - "black"
+    - "white"
+    - "gray"
+  default_author: "Design Team"
+  themes:
+    - "nature"
+    - "city"
+    - "abstract"
+    - "minimal"
+    - "dark"
+    - "light"
+    - "art"
+    - "technology"
+
+paths:
+  input_dir: "./input"
+  output_dir: "./output"
+  backup_dir: "./backup"
+  archive_dir: "./archive"
+  log_dir: "./logs"
