@@ -12,7 +12,8 @@ class Packager:
         self.config = config
 
     def _generate_release_notes(self, materials, tag_summary: Dict[str, Any],
-                                date_str: str) -> str:
+                                date_str: str, duplicates: List[Dict] = None,
+                                quality_reports: Dict = None) -> str:
         total = tag_summary["total_materials"]
         by_theme = tag_summary["by_theme"]
         by_orientation = tag_summary["by_orientation"]
@@ -20,7 +21,11 @@ class Packager:
         notes = f"# 每日壁纸包 - {date_str}\n\n"
         notes += f"## 概览\n\n"
         notes += f"- 发布日期: {date_str}\n"
-        notes += f"- 壁纸总数: {total} 张\n\n"
+        notes += f"- 壁纸总数: {total} 张\n"
+
+        if duplicates:
+            notes += f"- 相似素材组: {len(duplicates)} 组 (请发布前确认保留哪张)\n"
+        notes += "\n"
 
         if by_theme:
             notes += f"## 主题分布\n\n"
@@ -35,6 +40,24 @@ class Packager:
                 orient_cn = orient_map.get(orient, orient)
                 notes += f"- {orient_cn}: {count} 张\n"
             notes += "\n"
+
+        if duplicates:
+            notes += "## ⚠️ 相似素材提示\n\n"
+            notes += "以下素材相似度较高，发布前请确认保留哪一张：\n\n"
+            for i, dup in enumerate(duplicates, 1):
+                f1 = os.path.basename(dup['file1'])
+                f2 = os.path.basename(dup['file2'])
+                notes += f"### 重复组 #{i} (相似度: {dup['similarity']:.1f}%)\n\n"
+                notes += f"- **素材 A**: {f1}\n"
+                notes += f"- **素材 B**: {f2}\n"
+                if quality_reports:
+                    r1 = quality_reports.get(dup['file1'])
+                    r2 = quality_reports.get(dup['file2'])
+                    if r1:
+                        notes += f"  - 模糊分数: {r1.blur_score:.1f}\n"
+                    if r2:
+                        notes += f"  - 模糊分数: {r2.blur_score:.1f}\n"
+                notes += "\n"
 
         notes += f"## 设备支持\n\n"
         notes += f"### 移动端\n"
@@ -120,17 +143,22 @@ class Packager:
 
     def create_package(self, materials, resized_images: Dict[str, List],
                        preview_paths: Dict[str, str], output_dir: str,
-                       date_str: str = None) -> Dict[str, Any]:
+                       date_str: str = None, duplicates: List[Dict] = None,
+                       quality_reports: Dict = None) -> Dict[str, Any]:
         if date_str is None:
             date_str = datetime.now().strftime("%Y-%m-%d")
 
         package_dir = os.path.join(output_dir, f"wallpaper_pack_{date_str}")
         os.makedirs(package_dir, exist_ok=True)
 
-        tag_organizer = __import__('src.tag_organizer', fromlist=['TagOrganizer']).TagOrganizer(self.config)
+        from .tag_organizer import TagOrganizer
+        tag_organizer = TagOrganizer(self.config)
         tag_summary = tag_organizer.generate_tag_summary(materials)
 
-        release_notes = self._generate_release_notes(materials, tag_summary, date_str)
+        release_notes = self._generate_release_notes(
+            materials, tag_summary, date_str,
+            duplicates=duplicates, quality_reports=quality_reports
+        )
         release_notes_path = os.path.join(package_dir, "README.md")
         with open(release_notes_path, "w", encoding="utf-8") as f:
             f.write(release_notes)
