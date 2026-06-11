@@ -31,6 +31,17 @@ STATUS_SUCCESS = "success"
 STATUS_FAILED = "failed"
 STATUS_SKIPPED = "skipped"
 
+STATUS_NAMES_CN = {
+    STATUS_PENDING: "等待",
+    STATUS_RUNNING: "运行中",
+    STATUS_SUCCESS: "成功",
+    STATUS_FAILED: "失败",
+    STATUS_SKIPPED: "跳过",
+}
+
+NEEDS_REVIEW_QC_FAILED = "qc_failed"
+NEEDS_REVIEW_DUPLICATE = "duplicate"
+
 
 @dataclass
 class StageRecord:
@@ -120,10 +131,12 @@ class TaskLogger:
         self._task_log_path = os.path.join(self.log_dir, "tasks.json")
         self._failed_log_path = os.path.join(self.log_dir, "failed.json")
         self._backup_log_path = os.path.join(self.log_dir, "backups.json")
+        self._cache_path = os.path.join(self.log_dir, "cache.json")
 
         self._tasks: Dict[str, TaskRecord] = {}
         self._failed: Dict[str, TaskRecord] = {}
         self._backups: Dict[str, BackupRecord] = {}
+        self._cache: Dict[str, Any] = {}
 
         self._load_all()
 
@@ -139,6 +152,8 @@ class TaskLogger:
         backup_data = self._load_json(self._backup_log_path)
         for bid, bdata in backup_data.items():
             self._backups[bid] = BackupRecord(**bdata)
+
+        self._cache = self._load_json(self._cache_path)
 
     def _load_json(self, path: str) -> Dict[str, Any]:
         if os.path.exists(path):
@@ -160,6 +175,18 @@ class TaskLogger:
     def _save_backups(self) -> None:
         data = {k: asdict(v) for k, v in self._backups.items()}
         self._save_json(data, self._backup_log_path)
+
+    def save_cache(self, key: str, value: Any) -> None:
+        self._cache[key] = value
+        self._save_json(self._cache, self._cache_path)
+
+    def get_cache(self, key: str, default: Any = None) -> Any:
+        return self._cache.get(key, default)
+
+    def clear_cache(self) -> None:
+        self._cache = {}
+        if os.path.exists(self._cache_path):
+            os.remove(self._cache_path)
 
     def _save_json(self, data: Dict[str, Any], path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -215,9 +242,10 @@ class TaskLogger:
             if metadata:
                 record.metadata.update(metadata)
 
-            start = datetime.fromisoformat(record.started_at)
-            end = datetime.fromisoformat(record.finished_at)
-            record.duration_ms = int((end - start).total_seconds() * 1000)
+            if record.started_at:
+                start = datetime.fromisoformat(record.started_at)
+                end = datetime.fromisoformat(record.finished_at)
+                record.duration_ms = int((end - start).total_seconds() * 1000)
 
             if stage == STAGE_PACKAGE:
                 task.overall_status = STATUS_SUCCESS
@@ -263,7 +291,6 @@ class TaskLogger:
             record.status = STATUS_SKIPPED
             record.finished_at = datetime.now().isoformat()
             record.metadata["skip_reason"] = reason
-
             record.duration_ms = 0
 
             self._save_tasks()
@@ -301,6 +328,9 @@ class TaskLogger:
                 task.input_file, new_task_id
             )
             if result:
+                if task_id in self._failed:
+                    del self._failed[task_id]
+                    self._save_failed()
                 return self._tasks.get(new_task_id)
             else:
                 return None
@@ -388,23 +418,43 @@ class TaskLogger:
         total = len(self._tasks)
         by_status = defaultdict(int)
         by_stage = defaultdict(int)
+        stage_status = defaultdict(lambda: defaultdict(int))
         total_duration = 0
 
         for task in self._tasks.values():
             by_status[task.overall_status] += 1
             by_stage[task.current_stage] += 1
-            for stage in task.stages.values():
+            for stage_name, stage in task.stages.items():
+                stage_status[stage_name][stage.status] += 1
                 total_duration += stage.duration_ms
 
         return {
             "total_tasks": total,
             "by_status": dict(by_status),
             "by_stage": dict(by_stage),
+            "stage_status": {k: dict(v) for k, v in stage_status.items()},
             "failed_tasks": len(self._failed),
             "total_backups": len(self._backups),
             "total_duration_ms": total_duration,
             "avg_duration_ms": total_duration / total if total > 0 else 0
         }
+
+    def _get_device_list(self) -> List[str]:
+        device_list = []
+        for category in ["mobile", "desktop", "tablet"]:
+            for device in self.config.get_device_resolutions(category):
+                device_list.append(device["name"])
+        return device_list
+
+    def _build_duplicate_map(self, duplicates: List[Dict]) -> Dict[str, Tuple[str, str, float]]:
+        duplicate_map = {}
+        if duplicates:
+            for i, dup in enumerate(duplicates):
+                f1 = os.path.basename(dup["file1"])
+                f2 = os.path.basename(dup["file2"])
+                duplicate_map[f1] = (f"组{i+1:02d}", f2, dup["similarity"])
+                duplicate_map[f2] = (f"组{i+1:02d}", f1, dup["similarity"])
+        return duplicate_map
 
     def export_manifest_csv(self, materials, quality_reports: Dict,
                             resized_results: Dict, package_info: Dict,
@@ -415,10 +465,8 @@ class TaskLogger:
 
         os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-        device_list = []
-        for category in ["mobile", "desktop", "tablet"]:
-            for device in self.config.get_device_resolutions(category):
-                device_list.append(device["name"])
+        device_list = self._get_device_list()
+        duplicate_map = self._build_duplicate_map(duplicates)
 
         with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
             writer = csv.writer(f)
@@ -430,27 +478,19 @@ class TaskLogger:
                 "重复组", "相似素材",
                 "各设备分辨率数量",
             ] + device_list + [
-                "预览图路径", "下载包路径", "任务状态"
+                "预览图路径", "下载包路径", "任务状态", "任务ID"
             ]
             writer.writerow(header)
 
-            duplicate_map = {}
-            if duplicates:
-                for i, dup in enumerate(duplicates):
-                    f1 = os.path.basename(dup["file1"])
-                    f2 = os.path.basename(dup["file2"])
-                    duplicate_map[f1] = (f"组{i+1}", f2, dup["similarity"])
-                    duplicate_map[f2] = (f"组{i+1}", f1, dup["similarity"])
-
             for m in materials:
                 report = quality_reports.get(m.file_path)
-                qc_status = "通过"
-                blur_score = ""
-                qc_issues = ""
+                qc_status = "跳过"
+                blur_score = "—"
+                qc_issues = "已跳过"
                 if report:
                     qc_status = "通过" if report.passed else "未通过"
                     blur_score = f"{report.blur_score:.1f}"
-                    qc_issues = "; ".join([f"{i.issue_type}({i.severity})" for i in report.issues])
+                    qc_issues = "; ".join([f"{i.issue_type}({i.severity})" for i in report.issues]) if report.issues else "—"
 
                 dup_group = ""
                 dup_similar = ""
@@ -471,6 +511,7 @@ class TaskLogger:
                     device_cells.append(device_counts.get(dev_name, 0))
 
                 task_status = "未知"
+                task_id = ""
                 for task in self._tasks.values():
                     if task.filename == m.filename:
                         status_map = {
@@ -478,19 +519,26 @@ class TaskLogger:
                             STATUS_FAILED: "失败",
                             STATUS_RUNNING: "运行中",
                             STATUS_PENDING: "等待中",
+                            STATUS_SKIPPED: "跳过",
                         }
                         task_status = status_map.get(task.overall_status, task.overall_status)
+                        task_id = task.task_id
                         break
 
                 zip_path = package_info.get("zip_path", "")
+                preview_name = os.path.splitext(m.filename)[0] + "_preview.jpg"
+                preview_rel = f"previews/{preview_name}"
+
+                orient_cn = "横屏" if m.orientation == "landscape" else "竖屏" if m.orientation == "portrait" else "方形"
+                color_tags = ", ".join([t for t in m.tags if t in self.config.get_color_tags()])
 
                 writer.writerow([
                     m.filename,
                     m.theme,
-                    ", ".join([t for t in m.tags if t in self.config.get_color_tags()]),
+                    color_tags,
                     m.author,
                     f"{m.width}x{m.height}",
-                    "横屏" if m.orientation == "landscape" else "竖屏" if m.orientation == "portrait" else "方形",
+                    orient_cn,
                     qc_status,
                     blur_score,
                     qc_issues,
@@ -498,32 +546,246 @@ class TaskLogger:
                     dup_similar,
                     total_resolutions,
                 ] + device_cells + [
-                    os.path.basename(package_info.get("package_dir", "")) + "/previews/" + m.filename.replace(".jpg", "_preview.jpg").replace(".png", "_preview.jpg"),
+                    preview_rel,
                     os.path.basename(zip_path) if zip_path else "",
-                    task_status
+                    task_status,
+                    task_id
                 ])
+
+        return output_path
+
+    def export_review_csv(self, materials, quality_reports: Dict,
+                          duplicates: List[Dict] = None,
+                          filter_duplicate: bool = True,
+                          filter_qc_failed: bool = True,
+                          filter_theme: str = None,
+                          filter_author: str = None,
+                          filter_orientation: str = None,
+                          output_path: str = None) -> str:
+        if output_path is None:
+            output_path = os.path.join(self.log_dir, "review_manifest.csv")
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        duplicate_map = self._build_duplicate_map(duplicates)
+
+        review_items = []
+        for m in materials:
+            is_dup = m.filename in duplicate_map
+            report = quality_reports.get(m.file_path)
+            qc_passed = report.passed if report else True
+
+            needs_review = False
+            review_reasons = []
+
+            if filter_duplicate and is_dup:
+                needs_review = True
+                info = duplicate_map[m.filename]
+                review_reasons.append(f"重复素材({info[0]})")
+
+            if filter_qc_failed and not qc_passed:
+                needs_review = True
+                issues = [i.issue_type for i in (report.issues if report else [])]
+                review_reasons.append(f"质检未通过({', '.join(issues)})")
+
+            if filter_theme and m.theme != filter_theme:
+                continue
+            if filter_author and m.author != filter_author:
+                continue
+            if filter_orientation and m.orientation != filter_orientation:
+                continue
+
+            if needs_review or (not filter_duplicate and not filter_qc_failed):
+                review_items.append((m, report, is_dup, review_reasons))
+
+        with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+
+            header = [
+                "确认状态", "文件名", "主题", "作者",
+                "原分辨率", "画幅方向",
+                "质检状态", "模糊分数", "质检问题",
+                "重复组", "相似素材", "相似度",
+                "需确认原因",
+                "建议保留", "备注"
+            ]
+            writer.writerow(header)
+
+            for m, report, is_dup, reasons in review_items:
+                qc_status = "跳过"
+                blur_score = "—"
+                qc_issues = "已跳过"
+                if report:
+                    qc_status = "✅通过" if report.passed else "❌未通过"
+                    blur_score = f"{report.blur_score:.1f}"
+                    qc_issues = "; ".join([f"{i.issue_type}({i.severity})" for i in report.issues]) if report.issues else "—"
+
+                dup_group = ""
+                dup_similar = ""
+                dup_similarity = ""
+                if is_dup:
+                    info = duplicate_map[m.filename]
+                    dup_group = info[0]
+                    dup_similar = info[1]
+                    dup_similarity = f"{info[2]:.1f}%"
+
+                orient_cn = "横屏" if m.orientation == "landscape" else "竖屏" if m.orientation == "portrait" else "方形"
+
+                writer.writerow([
+                    "待确认",
+                    m.filename,
+                    m.theme,
+                    m.author,
+                    f"{m.width}x{m.height}",
+                    orient_cn,
+                    qc_status,
+                    blur_score,
+                    qc_issues,
+                    dup_group,
+                    dup_similar,
+                    dup_similarity,
+                    "; ".join(reasons),
+                    "是/否",
+                    ""
+                ])
+
+        return output_path, len(review_items)
+
+    def get_review_summary(self, materials, quality_reports: Dict,
+                           duplicates: List[Dict] = None) -> Dict[str, Any]:
+        duplicate_map = self._build_duplicate_map(duplicates)
+
+        total = len(materials)
+        duplicate_count = 0
+        qc_failed_count = 0
+        both_count = 0
+        clean_count = 0
+
+        by_theme = defaultdict(lambda: {"total": 0, "duplicate": 0, "qc_failed": 0, "clean": 0})
+        by_orientation = defaultdict(lambda: {"total": 0, "duplicate": 0, "qc_failed": 0, "clean": 0})
+        by_author = defaultdict(lambda: {"total": 0, "duplicate": 0, "qc_failed": 0, "clean": 0})
+
+        duplicate_groups = defaultdict(list)
+        if duplicates:
+            for i, dup in enumerate(duplicates):
+                group_name = f"组{i+1:02d}"
+                duplicate_groups[group_name].append(dup)
+
+        for m in materials:
+            is_dup = m.filename in duplicate_map
+            report = quality_reports.get(m.file_path)
+            qc_passed = report.passed if report else True
+
+            has_issue = is_dup or not qc_passed
+            if is_dup and not qc_passed:
+                both_count += 1
+            elif is_dup:
+                duplicate_count += 1
+            elif not qc_passed:
+                qc_failed_count += 1
+            else:
+                clean_count += 1
+
+            for counter in [by_theme[m.theme], by_orientation[m.orientation], by_author[m.author]]:
+                counter["total"] += 1
+                if is_dup:
+                    counter["duplicate"] += 1
+                if report and not report.passed:
+                    counter["qc_failed"] += 1
+                if not is_dup and (report and report.passed):
+                    counter["clean"] += 1
+
+        return {
+            "total": total,
+            "duplicate_only": duplicate_count,
+            "qc_failed_only": qc_failed_count,
+            "both_issues": both_count,
+            "clean": clean_count,
+            "needs_review": total - clean_count,
+            "duplicate_groups_count": len(duplicate_groups),
+            "by_theme": dict(by_theme),
+            "by_orientation": dict(by_orientation),
+            "by_author": dict(by_author),
+        }
+
+    def generate_batch_summary(self, materials=None,
+                               quality_reports: Dict = None,
+                               duplicates: List[Dict] = None,
+                               package_info: Dict = None,
+                               output_path: str = None) -> str:
+        if output_path is None:
+            output_path = os.path.join(self.log_dir, "batch_summary.csv")
+
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+        review_summary = self.get_review_summary(materials or [], quality_reports or {}, duplicates or [])
+        stats = self.get_statistics()
+
+        by_theme_data = review_summary.get("by_theme", {})
+
+        with open(output_path, "w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f)
+
+            writer.writerow([f"发布批次摘要 - {self.date_str}"])
+            writer.writerow([])
+            writer.writerow(["概览"])
+            writer.writerow(["日期", self.date_str])
+            writer.writerow(["素材总数", review_summary["total"]])
+            writer.writerow(["可直接发布", review_summary["clean"]])
+            writer.writerow(["重复待确认", review_summary["duplicate_only"] + review_summary["both_issues"]])
+            writer.writerow(["质检失败", review_summary["qc_failed_only"] + review_summary["both_issues"]])
+            writer.writerow(["任务成功", stats["by_status"].get(STATUS_SUCCESS, 0)])
+            writer.writerow(["任务失败", stats["by_status"].get(STATUS_FAILED, 0)])
+            writer.writerow(["下载包", os.path.basename(package_info.get("zip_path", "")) if package_info else ""])
+            writer.writerow([])
+
+            writer.writerow(["按主题汇总"])
+            writer.writerow(["主题", "总数", "可发布", "重复待确认", "质检失败", "失败任务数"])
+
+            failed_by_theme = defaultdict(int)
+            for task in self._tasks.values():
+                if task.overall_status == STATUS_FAILED:
+                    theme = task.metadata.get("theme", "未分类")
+                    failed_by_theme[theme] += 1
+
+            for theme in sorted(by_theme_data.keys()):
+                tdata = by_theme_data[theme]
+                dup_count = tdata.get("duplicate", 0)
+                qc_fail = tdata.get("qc_failed", 0)
+                writer.writerow([
+                    theme,
+                    tdata["total"],
+                    tdata.get("clean", 0),
+                    dup_count,
+                    qc_fail,
+                    failed_by_theme.get(theme, 0)
+                ])
+            writer.writerow([])
+
+            writer.writerow(["失败任务列表"])
+            writer.writerow(["任务ID", "文件名", "失败阶段", "错误信息"])
+            for task_id, task in self._failed.items():
+                failed_stage = task.current_stage
+                stage_cn = STAGE_NAMES.get(failed_stage, failed_stage)
+                error = task.stages.get(failed_stage, None).error_message if failed_stage in task.stages else ""
+                writer.writerow([task_id, task.filename, stage_cn, error])
 
         return output_path
 
     def generate_summary_report(self, materials=None,
                                 quality_reports: Dict = None,
                                 duplicates: List[Dict] = None,
+                                package_info: Dict = None,
                                 output_path: str = None) -> str:
         stats = self.get_statistics()
 
-        report = "# 壁纸包处理报告\n\n"
+        report = f"# 壁纸包处理报告 - {self.date_str}\n\n"
         report += f"生成时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
 
         report += "## 📊 统计概览\n\n"
         report += f"- 总任务数: {stats['total_tasks']}\n"
-        status_map_cn = {
-            STATUS_SUCCESS: "成功",
-            STATUS_FAILED: "失败",
-            STATUS_RUNNING: "运行中",
-            STATUS_PENDING: "等待中",
-        }
         for status, count in stats['by_status'].items():
-            cn = status_map_cn.get(status, status)
+            cn = STATUS_NAMES_CN.get(status, status)
             report += f"- {cn}: {count}\n"
         report += f"- 备份文件数: {stats['total_backups']}\n"
         report += f"- 总处理时长: {stats['total_duration_ms']/1000:.1f} 秒\n\n"
@@ -532,36 +794,58 @@ class TaskLogger:
         report += "| 阶段 | 等待 | 运行中 | 成功 | 失败 | 跳过 |\n"
         report += "|------|------|--------|------|------|------|\n"
 
+        stage_status = stats.get("stage_status", {})
         for stage in [STAGE_IMPORT, STAGE_QUALITY, STAGE_TAG, STAGE_RESIZE, STAGE_PACKAGE]:
             stage_cn = STAGE_NAMES.get(stage, stage)
-            pending = running = success = failed = skipped = 0
-            for task in self._tasks.values():
-                if stage in task.stages:
-                    s = task.stages[stage].status
-                    if s == STATUS_PENDING:
-                        pending += 1
-                    elif s == STATUS_RUNNING:
-                        running += 1
-                    elif s == STATUS_SUCCESS:
-                        success += 1
-                    elif s == STATUS_FAILED:
-                        failed += 1
-                    elif s == STATUS_SKIPPED:
-                        skipped += 1
+            sdata = stage_status.get(stage, {})
+            pending = sdata.get(STATUS_PENDING, 0)
+            running = sdata.get(STATUS_RUNNING, 0)
+            success = sdata.get(STATUS_SUCCESS, 0)
+            failed = sdata.get(STATUS_FAILED, 0)
+            skipped = sdata.get(STATUS_SKIPPED, 0)
             report += f"| {stage_cn} | {pending} | {running} | {success} | {failed} | {skipped} |\n"
 
         report += "\n"
 
+        if duplicates or (quality_reports and materials):
+            review = self.get_review_summary(materials or [], quality_reports or {}, duplicates or [])
+            report += "## 🔍 发布复核\n\n"
+            report += f"| 类别 | 数量 |\n"
+            report += f"|------|------|\n"
+            report += f"| 素材总数 | {review['total']} |\n"
+            report += f"| ✅ 可直接发布 | {review['clean']} |\n"
+            report += f"| ⚠️ 重复待确认 | {review['duplicate_only'] + review['both_issues']} |\n"
+            report += f"| ❌ 质检失败 | {review['qc_failed_only'] + review['both_issues']} |\n"
+            report += f"| 🔁 两项都有问题 | {review['both_issues']} |\n"
+            report += "\n"
+
+            if review['by_theme']:
+                report += "### 按主题分布\n\n"
+                report += "| 主题 | 总数 | 可发布 | 重复 | 质检失败 |\n"
+                report += "|------|------|--------|------|----------|\n"
+                for theme, tdata in sorted(review['by_theme'].items()):
+                    report += f"| {theme} | {tdata['total']} | {tdata.get('clean', 0)} | {tdata.get('duplicate', 0)} | {tdata.get('qc_failed', 0)} |\n"
+                report += "\n"
+
         if duplicates:
             report += "## ⚠️ 重复素材检测\n\n"
-            report += f"共检测到 **{len(duplicates)}** 组相似素材:\n\n"
+            report += f"共检测到 **{len(duplicates)}** 组相似素材 (发布前请确认保留哪一张):\n\n"
             for i, dup in enumerate(duplicates, 1):
                 f1 = os.path.basename(dup['file1'])
                 f2 = os.path.basename(dup['file2'])
-                report += f"### 重复组 #{i} (相似度: {dup['similarity']:.1f}%)\n\n"
+                report += f"### 重复组 #{i:02d} (相似度: {dup['similarity']:.1f}%)\n\n"
                 report += f"- **素材A**: {f1}\n"
                 report += f"- **素材B**: {f2}\n"
-                report += f"- 汉明距离: {dup['hamming_distance']}\n\n"
+                if quality_reports:
+                    r1 = quality_reports.get(dup['file1'])
+                    r2 = quality_reports.get(dup['file2'])
+                    if r1:
+                        qc_a = "✅通过" if r1.passed else "❌未通过"
+                        report += f"  - 质检: {qc_a}, 模糊分: {r1.blur_score:.1f}\n"
+                    if r2:
+                        qc_b = "✅通过" if r2.passed else "❌未通过"
+                        report += f"  - 质检: {qc_b}, 模糊分: {r2.blur_score:.1f}\n"
+                report += "\n"
 
         if self._failed:
             report += "## ❌ 失败任务详情\n\n"
@@ -576,7 +860,10 @@ class TaskLogger:
                 report += f"- 文件: {task.filename}\n"
                 report += f"- 失败阶段: {stage_cn}\n"
                 report += f"- 错误信息: {error_msg}\n"
-                report += f"- 创建时间: {task.created_at}\n\n"
+                report += f"- 创建时间: {task.created_at}\n"
+                if task.metadata.get("retry_from"):
+                    report += f"- 重跑来源: {task.metadata['retry_from']}\n"
+                report += "\n"
 
         if materials and quality_reports:
             report += "## 📝 完整素材清单\n\n"
@@ -588,15 +875,22 @@ class TaskLogger:
 
             for theme, items in sorted(theme_groups.items()):
                 report += f"### {theme.capitalize()} ({len(items)} 张)\n\n"
-                report += "| 文件名 | 分辨率 | 画幅 | 质检 | 标签 |\n"
-                report += "|--------|--------|------|------|------|\n"
+                report += "| 文件名 | 分辨率 | 画幅 | 质检 | 标签 | 任务状态 |\n"
+                report += "|--------|--------|------|------|------|----------|\n"
 
                 for m in sorted(items, key=lambda x: x.filename):
                     report_q = quality_reports.get(m.file_path)
-                    qc_icon = "✅" if report_q and report_q.passed else "❌"
+                    qc_icon = "✅" if report_q and report_q.passed else "⏭️" if report_q is None else "❌"
                     orient_cn = "横屏" if m.orientation == "landscape" else "竖屏" if m.orientation == "portrait" else "方形"
                     tags_str = ", ".join(m.tags[:5]) if m.tags else "无"
-                    report += f"| {m.filename} | {m.width}x{m.height} | {orient_cn} | {qc_icon} | {tags_str} |\n"
+
+                    task_status = "—"
+                    for task in self._tasks.values():
+                        if task.filename == m.filename:
+                            task_status = STATUS_NAMES_CN.get(task.overall_status, task.overall_status)
+                            break
+
+                    report += f"| {m.filename} | {m.width}x{m.height} | {orient_cn} | {qc_icon} | {tags_str} | {task_status} |\n"
 
                 report += "\n"
 

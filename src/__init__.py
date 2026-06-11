@@ -8,11 +8,12 @@ from .task_logger import (
     TaskLogger, TaskRecord, BackupRecord, StageRecord,
     STAGE_IMPORT, STAGE_QUALITY, STAGE_TAG, STAGE_RESIZE, STAGE_PACKAGE, STAGE_DONE,
     STATUS_PENDING, STATUS_RUNNING, STATUS_SUCCESS, STATUS_FAILED, STATUS_SKIPPED,
-    STAGE_NAMES,
+    STAGE_NAMES, STATUS_NAMES_CN,
+    NEEDS_REVIEW_QC_FAILED, NEEDS_REVIEW_DUPLICATE,
 )
 from .pipeline import WallpaperPipeline
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __all__ = [
     "Config",
     "Material",
@@ -41,4 +42,7 @@ __all__ = [
     "STATUS_FAILED",
     "STATUS_SKIPPED",
     "STAGE_NAMES",
+    "STATUS_NAMES_CN",
+    "NEEDS_REVIEW_QC_FAILED",
+    "NEEDS_REVIEW_DUPLICATE",
 ]
